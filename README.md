@@ -15,7 +15,8 @@ A simple and convenient Bash script to send messages to Telegram via Bot API.
   Interactive message input or passing the message immediately via the `--message` parameter
 - Проверка успешной отправки сообщения с помощью `jq`  
   Checks message sending success using `jq`
-
+- Минимальные зависимости (требуется `curl`, `jq`, `python3`)  
+  Minimal dependencies (`curl`, `jq`, `python3` required)
 ---
 
 ## Установка / Installation
