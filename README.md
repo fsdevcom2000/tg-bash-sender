@@ -51,7 +51,6 @@ Values can be overridden via CLI arguments.
 
 ## Usage
 
-Код
 
 ```bash
 ./telegram_sender.sh [--token TOKEN] [--chat_id CHAT_ID] [--message MESSAGE]
