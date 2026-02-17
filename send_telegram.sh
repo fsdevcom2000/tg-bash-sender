@@ -1,89 +1,137 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
 
 CONFIG_FILE="./config.json"
+LOCK_FILE="/run/telegram_sender.lock"
+
+MAX_RETRIES=5
+BASE_DELAY=2
+CURL_TIMEOUT=20
+CONNECT_TIMEOUT=10
 
 usage() {
-  echo "Использование: $0 [--token TOKEN] [--chat_id CHAT_ID] [--message MESSAGE]"
-  echo
-  echo "Если параметры не заданы, значения берутся из $CONFIG_FILE"
-  echo
-  echo "Параметры:"
-  echo "  --token TOKEN       Токен Telegram бота"
-  echo "  --chat_id CHAT_ID   ID чата Telegram"
-  echo "  --message MESSAGE   Текст сообщения для отправки (если не указан, будет запрос)"
-  echo "  -h, --help          Показать это сообщение"
+  cat <<EOF
+Usage: $0 [--token TOKEN] [--chat_id CHAT_ID] [--message MESSAGE]
+EOF
 }
 
-# Проверяем наличие jq
-if ! command -v jq >/dev/null 2>&1; then
-  echo "Ошибка: для работы скрипта требуется jq."
-  echo "Установите jq: sudo apt install jq"
-  exit 1
-fi
+log() {
+  local level="$1"
+  shift
+  logger -t telegram_sender "[$level] $*"
+}
 
-# Проверяем наличие конфига
-if [[ ! -f $CONFIG_FILE ]]; then
-  echo "Ошибка: файл конфигурации $CONFIG_FILE не найден."
+error_exit() {
+  log "ERROR" "$*"
+  printf "Error: %s\n" "$*" >&2
   exit 1
-fi
+}
 
-# Читаем токен и чат айди из JSON
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || error_exit "Command '$1' not found."
+}
+
+# --- Dependency check ---
+for cmd in curl jq flock logger; do
+  require_command "$cmd"
+done
+
+# --- Configuration check ---
+[[ -f "$CONFIG_FILE" ]] || error_exit "Configuration file not found: $CONFIG_FILE"
+
 TOKEN=$(jq -r '.token // empty' "$CONFIG_FILE")
 CHAT_ID=$(jq -r '.chat_id // empty' "$CONFIG_FILE")
-
 MESSAGE=""
 
-# Разбираем параметры командной строки
+# --- Argument parsing ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --token)
-      TOKEN="$2"
-      shift 2
-      ;;
-    --chat_id)
-      CHAT_ID="$2"
-      shift 2
-      ;;
-    --message|-m)
-      MESSAGE="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Неизвестный параметр: $1"
-      usage
-      exit 1
-      ;;
+    --token) TOKEN="${2:-}"; shift 2 ;;
+    --chat_id) CHAT_ID="${2:-}"; shift 2 ;;
+    --message|-m) MESSAGE="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) error_exit "Unknown parameter: $1" ;;
   esac
 done
 
-# Проверяем, что токен и чат айди заданы
-if [[ -z $TOKEN || -z $CHAT_ID ]]; then
-  echo "Ошибка: не задан токен или chat_id."
-  usage
-  exit 1
+[[ -z "$TOKEN" ]] && error_exit "Token not set."
+[[ -z "$CHAT_ID" ]] && error_exit "Chat_id not set."
+
+# --- Reading message ---
+if [[ -z "$MESSAGE" ]]; then
+  if [[ -t 0 ]]; then
+    echo "Enter message text:"
+  fi
+  MESSAGE=$(cat || true)
 fi
 
-# Если сообщение не передано в параметре, запрашиваем его
-if [[ -z $MESSAGE ]]; then
-  echo "Введите текст сообщения:"
-  read -r MESSAGE
+[[ -z "$MESSAGE" ]] && error_exit "Message is empty."
+
+# --- Lock ---
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "WARN" "Script is already running. Skipping execution."
+  exit 0
 fi
 
-# Кодируем сообщение
-ENCODED_MESSAGE=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$MESSAGE'''))")
+# --- Send function ---
+send_message() {
+  curl -sS --fail-with-body \
+    --connect-timeout "$CONNECT_TIMEOUT" \
+    --max-time "$CURL_TIMEOUT" \
+    -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+    -d "chat_id=${CHAT_ID}" \
+    --data-urlencode "text=${MESSAGE}" \
+    -w "\n%{http_code}"
+}
 
-# Отправляем сообщение и получаем ответ
-RESPONSE=$(curl -s "https://api.telegram.org/bot$TOKEN/sendMessage?chat_id=$CHAT_ID&text=$ENCODED_MESSAGE")
+# --- Main loop ---
+attempt=1
+delay=$BASE_DELAY
 
-# Проверяем ответ
-OK=$(echo "$RESPONSE" | jq -r '.ok')
-if [[ "$OK" == "true" ]]; then
-  echo "Сообщение успешно отправлено!"
-else
-  DESCRIPTION=$(echo "$RESPONSE" | jq -r '.description // "нет описания ошибки"')
-  echo "Ошибка отправки сообщения: $DESCRIPTION"
-fi
+while (( attempt <= MAX_RETRIES )); do
+  log "INFO" "Send attempt #$attempt"
+
+  HTTP_RESPONSE=$(send_message || true)
+  HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+  HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+
+  # --- Success ---
+  if [[ "$HTTP_CODE" == "200" ]]; then
+    if jq -e '.ok == true' >/dev/null <<<"$HTTP_BODY"; then
+      log "INFO" "Message sent successfully."
+      echo "Message sent."
+      exit 0
+    fi
+
+    # --- Telegram API error ---
+    ERROR_CODE=$(jq -r '.error_code // 0' <<<"$HTTP_BODY")
+    DESCRIPTION=$(jq -r '.description // "unknown error"' <<<"$HTTP_BODY")
+
+    # --- Rate limit ---
+    if [[ "$ERROR_CODE" == "429" ]]; then
+      RETRY_AFTER=$(jq -r '.parameters.retry_after // 5' <<<"$HTTP_BODY")
+      log "WARN" "Rate limit. Waiting $RETRY_AFTER seconds."
+      sleep "$RETRY_AFTER"
+      ((attempt++))
+      continue
+    fi
+
+    error_exit "Telegram API error: $DESCRIPTION"
+  fi
+
+  # --- Retry only for 5xx or network errors ---
+  if [[ "$HTTP_CODE" =~ ^5 ]] || [[ -z "$HTTP_CODE" ]]; then
+    log "WARN" "HTTP $HTTP_CODE. Retry in ${delay}s."
+    sleep "$delay"
+    delay=$(( delay * 2 ))
+    ((attempt++))
+    continue
+  fi
+
+  # --- Other errors are fatal ---
+  error_exit "HTTP error: $HTTP_CODE"
+done
+
+error_exit "Maximum retry attempts exceeded ($MAX_RETRIES)."
